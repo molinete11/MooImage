@@ -1,0 +1,7 @@
+.{
+    .name = .image_decoder,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.0",
+    .paths = .{""},
+    .fingerprint = 0x7b34787bc4a25f18,
+}

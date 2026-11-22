@@ -29,16 +29,24 @@ pub fn main(init: std.process.Init) !void{
 
     const width = readInt(u32, idhr.data[0..4], .big);
     const height = readInt(u32, idhr.data[4..8], .big);
+
+    print("width {}\nheight {}\ndepth {}\ncolor type {}\n", .{
+        width, height, idhr.data[8], idhr.data[9],
+    });
     
-    const out_image = try gpa.alloc(u8, width * height * 4);
-    defer gpa.free(out_image);
-    
+    const filtered_image = try gpa.alloc(u8, height * (1 + width * 3));
+    defer gpa.free(filtered_image);
+
+    const image = try gpa.alloc(u8, height * width * 3);
+    defer gpa.free(image);
+
+    @memset(image, 0);
 
     const compressed_data: []u8 = try readCompressedData(r, gpa);
     defer gpa.free(compressed_data);
 
-    try readZlib(compressed_data, out_image);
-
+    try readZlib(compressed_data, filtered_image);
+    try unfilter(filtered_image, image, width * 3, height);
 
     var test_buff: [1024]u8 = undefined;
     var f2 = try Io.Dir.cwd().createFile(init.io, "image_test/test.ppm", .{});
@@ -46,7 +54,7 @@ pub fn main(init: std.process.Init) !void{
     var fw = f2.writer(init.io, &test_buff);
     var w = &fw.interface;
     try w.print("P6\n{} {}\n255\n", .{width, height});
-    _ = try w.write(out_image);
+    _ = try w.write(image);
 }
 
 const Chunk = struct {
@@ -173,12 +181,55 @@ const Symbol = struct{
     len: u4 = 0,
 };
 
-
-
 const end_of_block: u15 = 256;
 
-fn readZlib(data: []u8, buffer: []u8) !void{
+fn unfilter(data: []u8, out: []u8, stride: usize, n_scanlines: usize) !void{
+    var r = Io.Reader.fixed(data);
 
+    if(data.len != (n_scanlines * (1 + stride))) return error.SUS;
+    if(out.len != (stride * n_scanlines)) return error.SUS2;
+
+    for (0..n_scanlines) |i| {
+        const filter_type = try r.takeByte();
+        print("{}\n", .{filter_type});
+        for(0..stride) |j|{
+
+            const curr_byte: usize = i * stride + j;
+
+            const prev_scan = if(i == 0) 0 else (i - 1) * stride + j;
+
+            const x = try r.takeByte();
+            const a: u8 = if(j < 3) 0 else out[curr_byte - 3];
+            const b: u8 = if(i == 0) 0 else out[prev_scan];
+            const c: u8 = if(i == 0 or j < 3) 0 else out[prev_scan - 3];
+
+            const unfiltered_byte = switch (filter_type) {
+                0 => x,
+                1 => x +% a,
+                2 => x +% b,
+                3 => x +% @as(u8, @truncate((@as(u16, a) + @as(u16, b)) / 2)),
+                4 => x +% paeth(a, b, c),
+                else => return error.InvalidFilter
+            };
+
+            out[curr_byte] = unfiltered_byte;
+        }   
+    }
+}
+
+fn paeth(a: u8, b: u8, c: u8) u8{
+    const p = @as(i32, a) + b - c;
+    const pa = @abs(p - a);
+    const pb = @abs(p - b);
+    const pc = @abs(p - c);
+
+    if(pa <= pb and pa <= pc)return a;
+    if(pb <= pc)return b;
+    return c;
+
+}
+
+fn readZlib(data: []u8, buffer: []u8) !void{
    
     const cmf: Cmf = @bitCast(data[0]);
     const flg: Flg = @bitCast(data[1]);
@@ -187,6 +238,7 @@ fn readZlib(data: []u8, buffer: []u8) !void{
     var stream = BitStream{.buffer = data[2..data.len-@sizeOf(u32)]};
     
     try decodeDeflate(&stream, buffer);
+
 }
 
 // bloque 2
@@ -205,10 +257,10 @@ fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
     var curr_byte: usize = 0;
     while(!last){
         const h: DeflateHeaderBlock = try readDeflateHeaderBlock(stream);
-        print("{}\n", .{h});
+        //print("{}\n", .{h});
         var huffman_codes = HuffmanPrefixCodes{};
 
-        if(h.bfinal == 1) {last = true; }
+        if(h.bfinal == 1) {last = true;}
 
         if(h.btype == 0){}
         else if(h.btype == 2){
@@ -219,38 +271,43 @@ fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
 
         while(!stop){
             const symbol = 
-                try  decode(&huffman_codes.ll_symbols, huffman_codes.ll_count, stream);
+                try decode(&huffman_codes.ll_symbols, huffman_codes.ll_count, stream);
         
             if(symbol < end_of_block){
-                print("byte(curr byte => {}) {}\n", .{curr_byte, symbol});
+                //print("byte(curr byte => {}) {}\n", .{curr_byte, symbol});
+ 
                 buffer[curr_byte] = @intCast(symbol);
                 curr_byte += 1;
+
             }else if(symbol == end_of_block){
                 stop = true;
-                print("EOB\n", .{});
-            }else {
+                //print("EOB\n", .{});
+            }else if(symbol > end_of_block){
 
-                const length =  try decodeLength(symbol, stream);
+                const length = 
+                    try decodeLength(symbol, stream);
 
                 const d_symbol = 
                     try decode(&huffman_codes.d_symbols, huffman_codes.d_count, stream);
 
-                const distance = try decodeDistance(d_symbol, stream);
+                const distance = 
+                    try decodeDistance(d_symbol, stream);
 
-                print("pair length({}) {}, distance({}) {}\n", .{symbol, length, d_symbol, distance});
+                //print("pair length({}) {}, distance({}) {}\n", .{symbol, length, d_symbol, distance});
 
                 const start = curr_byte - distance;
 
                 const end = start + length;
-
+          
                 const slice = buffer[start..end];
 
-                @memmove(buffer[curr_byte..curr_byte+length], slice);
+                for(0..length) |i| buffer[curr_byte + i] = slice[i];
 
                 curr_byte += length;
             }
         }
-    } 
+    }
+    print("{}\n", .{curr_byte}); 
 }
 
 
@@ -288,11 +345,11 @@ fn readCustomHuffmanPrefixCodes(stream: *BitStream) !HuffmanPrefixCodes{
         }}.f
     );
 
-    for(0..hclen) |i| print("name -> {}, code -> {b}, len -> {}\n", .{
-        cl_symbols[i].name,
-        cl_symbols[i].code,
-        cl_symbols[i].len,
-    });
+    //for(0..hclen) |i| print("name -> {}, code -> {b}, len -> {}\n", .{
+    //    cl_symbols[i].name,
+    //    cl_symbols[i].code,
+    //    cl_symbols[i].len,
+    //});
 
     var h_codes = HuffmanPrefixCodes{
         .d_count = hdist + 1,
@@ -359,17 +416,17 @@ fn readCustomHuffmanPrefixCodes(stream: *BitStream) !HuffmanPrefixCodes{
         }}.f
     );
 
-    for(0..h_codes.ll_count) |i| print("name -> {}, code -> {b}, len -> {}\n", .{
-        h_codes.ll_symbols[i].name,
-        h_codes.ll_symbols[i].code,
-        h_codes.ll_symbols[i].len,
-    });
+    //for(0..h_codes.ll_count) |i| print("name -> {}, code -> {b}, len -> {}\n", .{
+    //    h_codes.ll_symbols[i].name,
+    //    h_codes.ll_symbols[i].code,
+    //    h_codes.ll_symbols[i].len,
+    //});
 
-    for(0..h_codes.d_count) |i| print("name -> {}, code -> {b}, len -> {}\n", .{
-        h_codes.d_symbols[i].name,
-        h_codes.d_symbols[i].code,
-        h_codes.d_symbols[i].len,
-    });
+    //for(0..h_codes.d_count) |i| print("name -> {}, code -> {b}, len -> {}\n", .{
+    //    h_codes.d_symbols[i].name,
+    //    h_codes.d_symbols[i].code,
+    //    h_codes.d_symbols[i].len,
+    //});
 
     return h_codes;
 }

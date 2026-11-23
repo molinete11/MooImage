@@ -7,7 +7,7 @@ const Allocator = mem.Allocator;
 
 const Chunk = struct {
     len: u32 = 0,
-    type: [4]u8 = undefined,
+    ctype: [4]u8 = undefined,
     data: []u8 = undefined,
     crc: [4]u8 = undefined,
 };
@@ -24,6 +24,9 @@ const Flg = packed struct {
 };
 
 const HuffmanPrefixCodes = struct{
+    biggest_ll_length: u16 = 0,
+    biggest_d_length: u16 = 0,
+
     d_count: u16 = 0,
     ll_count: u16 = 0,
 
@@ -69,8 +72,8 @@ const BitStream = struct {
         fn peek8(self: *const BitStream, bits: usize) !u8{
             @setRuntimeSafety(false);
             if(bits == 0) return 0;
-            if(bits > 8) return error.BiggerThanExpected;
-            if(self.bits_consumed + bits > self.buffer.len * 8) return error.OutOfBounds;
+            if(bits > 8) {@branchHint(.unlikely); return error.BiggerThanExpected;}
+            if(self.bits_consumed + bits > self.buffer.len * 8) {@branchHint(.unlikely); return error.OutOfBounds;}
 
             const byte_idx = self.bits_consumed >> 3;
             const bit_idx = self.bits_consumed & 7;
@@ -263,7 +266,11 @@ fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
 
         while(!stop){
             const symbol = 
-                try decode(&huffman_codes.ll_symbols, huffman_codes.ll_count, stream);
+                try decode(
+                    &huffman_codes.ll_symbols, 
+                    huffman_codes.ll_count, 
+                    huffman_codes.biggest_ll_length, 
+                    stream);
         
             if(symbol < end_of_block){
                 //print("byte(curr byte => {}) {}\n", .{curr_byte, symbol});
@@ -280,7 +287,11 @@ fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
                     try decodeLength(symbol, stream);
 
                 const d_symbol = 
-                    try decode(&huffman_codes.d_symbols, huffman_codes.d_count, stream);
+                    try decode(
+                        &huffman_codes.d_symbols, 
+                        huffman_codes.d_count,
+                        huffman_codes.biggest_d_length, 
+                        stream);
 
                 const distance = 
                     try decodeDistance(d_symbol, stream);
@@ -336,6 +347,14 @@ fn readCustomHuffmanPrefixCodes(stream: *BitStream) !HuffmanPrefixCodes{
         }}.f
     );
 
+    const biggest_cl_lenght = bk: {
+        var val: u16 = 0;
+        for(0..hclen) |i| {
+            if(cl_symbols[i].len > val) val = cl_symbols[i].len;
+        }
+        break :bk val;
+    };
+
     //for(0..hclen) |i| print("name -> {}, code -> {b}, len -> {}\n", .{
     //    cl_symbols[i].name,
     //    cl_symbols[i].code,
@@ -352,7 +371,7 @@ fn readCustomHuffmanPrefixCodes(stream: *BitStream) !HuffmanPrefixCodes{
 
     while(code_len < hlit+hdist+258){
 
-        const code_symbol = try decode(&cl_symbols, hclen, stream);
+        const code_symbol = try decode(&cl_symbols, hclen, biggest_cl_lenght, stream);
         if(code_symbol <= 15){
 
             code_lengths[code_len] = @intCast(code_symbol);
@@ -406,6 +425,9 @@ fn readCustomHuffmanPrefixCodes(stream: *BitStream) !HuffmanPrefixCodes{
             return lhs.code < rhs.code;
         }}.f
     );
+
+    h_codes.biggest_ll_length = h_codes.ll_symbols[h_codes.ll_count - 1].len;
+    h_codes.biggest_d_length = h_codes.d_symbols[h_codes.d_count - 1].len;
 
     //for(0..h_codes.ll_count) |i| print("name -> {}, code -> {b}, len -> {}\n", .{
     //    h_codes.ll_symbols[i].name,
@@ -471,11 +493,18 @@ fn decodeLength(symbol: u15, stream: *BitStream) !u16{
 }
 
 
-fn decode(symbols: []Symbol, n: u16, stream: *BitStream) !u15{
+fn decode(symbols: []Symbol, n: u16, biggest: u16, stream: *BitStream) !u15{
+
+    const max_code =  try stream.peek(biggest);
+
     for(0..n)|i|{
-        if(symbols[i].len != 0 and 
-            (reverse(symbols[i].len, try stream.peek(symbols[i].len)) == symbols[i].code)){
-            stream.toss(symbols[i].len);
+        const len = symbols[i].len;
+
+        if(len != 0 and 
+            (reverse(len, (max_code & ((~(-%(@as(u16, 1) << @intCast(len)))))))) == symbols[i].code){
+
+            stream.toss(len);
+            
             return symbols[i].name;
         }
     }
@@ -510,17 +539,11 @@ fn sort(symbols: []Symbol, new_len: *u16) void{
 }
 
 inline fn reverse(len: usize, bits: u16) u16{
-    var i: usize = 0;
-    var n: u16 = 0;
 
-    while(i <= len - 1){
-        const bit = @intFromBool((bits & (@as(u16, 1) << (@intCast(i)))) > 0);
-        //std.debug.print("{}\n", .{len - i});
-        n |= @as(u16, bit) << @intCast(len - i - 1);
-        i += 1;
-    }
+    const extra = 16 - len;
 
-    return n;
+    return @bitReverse(bits) >> @intCast(extra);
+    
 }
 
 inline fn genHuffmanCodes(symbols: []Symbol, n: usize) void{
@@ -546,28 +569,40 @@ inline fn genHuffmanCodes(symbols: []Symbol, n: usize) void{
     }
 }
 
-
 /// Leer chunks criticos
 /// IDAT 
 /// PLTE
 /// IEND
 fn readCompressedData(r: *Io.Reader, gpa: Allocator) ![]u8{
-    var data: []u8 = &.{};
     
+    var chunk_data: std.ArrayList(u8) = .empty;
+
     while(true){
         var chunk = Chunk{};
-        try readChunk(r, gpa, &chunk);
-        defer gpa.free(chunk.data);
+
+        chunk.len = try r.takeInt(u32, .big);
         
-        if(mem.eql(u8, &chunk.type, "IEND")) break;
-        if(mem.eql(u8, &chunk.type, "IDAT")){
-            const tmp = try mem.concat(gpa, u8, &.{data, chunk.data});
-            gpa.free(data);
-            data = tmp;
+        if(chunk.len >= std.math.maxInt(u31) - 1) return error.ChunkTooLarge;
+
+        try r.readSliceEndian(u8, &chunk.ctype, .big);
+
+        if(!mem.eql(u8, &chunk.ctype, "IDAT")) {
+            try r.discardAll(chunk.len + 4);
+
+            if(mem.eql(u8, &chunk.ctype, "IEND")) break;
+            continue;
         }
+        
+        const data = try r.readAllocAll(gpa, chunk.len);
+        defer gpa.free(data);
+        try chunk_data.appendSlice(gpa, data);
+        
+        // TODO: check corruption
+        try r.readSliceEndian(u8, &chunk.crc, .big);
+        
     }
 
-    return data;
+    return try chunk_data.toOwnedSlice(gpa);
 }
 
 fn readChunk(r: *Io.Reader, allocator: Allocator, chunk: *Chunk) !void{
@@ -575,7 +610,8 @@ fn readChunk(r: *Io.Reader, allocator: Allocator, chunk: *Chunk) !void{
     
     if(chunk.len >= std.math.maxInt(u31) - 1) return error.ChunkTooLarge;
 
-    try r.readSliceEndian(u8, &chunk.type, .big);
+    try r.readSliceEndian(u8, &chunk.ctype, .big);
+    
     chunk.data = try r.readAllocAll(allocator, chunk.len);
     errdefer allocator.free(chunk.data);
     

@@ -69,50 +69,30 @@ const BitStream = struct {
         return ret;
     }
 
-        fn peek8(self: *const BitStream, bits: usize) !u8{
-            @setRuntimeSafety(false);
-            if(bits == 0) return 0;
-            if(bits > 8) {@branchHint(.unlikely); return error.BiggerThanExpected;}
-            if(self.bits_consumed + bits > self.buffer.len * 8) {@branchHint(.unlikely); return error.OutOfBounds;}
 
-            const byte_idx = self.bits_consumed >> 3;
-            const bit_idx = self.bits_consumed & 7;
+    fn peek(self: *BitStream, bits: usize) !u16{
+        @setRuntimeSafety(false);
+        if(bits == 0) return 0;
+        if(self.bits_consumed + bits > self.buffer.len * 8) {@branchHint(.unlikely); return error.OutOfBounds;}
 
-            var buffer: u8 = 0;
+        const byte_idx = self.bits_consumed >> 3;
+        const bit_idx = self.bits_consumed & 7;
+        
+        var buffer: u24 = self.buffer[byte_idx];
 
-            if(bit_idx + bits > 8){
-                const first_len = 8 - bit_idx;
-                const second_len = bits - first_len;
-                {
-                    const mask: u8 = @truncate(~(-%(@as(u16, 1) << @intCast(first_len))));
-                    buffer |= (self.buffer[byte_idx] >> @intCast(bit_idx)) & mask;
-                }
-                {
-                    const mask: u8 = @truncate(~(-%(@as(u16, 1) << @intCast(second_len))));
-                    buffer |= (self.buffer[byte_idx + 1] & mask) << @intCast(first_len);
-                }
-                return buffer;
+        if(bit_idx + bits > 8){
+            buffer |= @as(u24, self.buffer[byte_idx + 1]) << 8;
+
+            if(bit_idx + bits > 16){
+                buffer |= @as(u24, self.buffer[byte_idx + 2]) << 16;
             }
-
-            const mask: u8 = @truncate(~(-%(@as(u16, 1) << @intCast(bits))));
-            buffer |= (self.buffer[byte_idx] >> @intCast(bit_idx)) & mask;
-
-            return buffer;
         }
 
-        fn peek(self: *BitStream, bits: usize) !u16{
-            if(bits <= 8) return try self.peek8(bits);
+        const mask: u16 = ~(-%(@as(u16, 1) << @intCast(bits)));
+        return @as(u16, @truncate((buffer >> @intCast(bit_idx)))) & mask;
 
-            const prev = self.bits_consumed;
+    }
 
-            var buffer: u16 = try self.peek8(8);
-            self.toss(8);
-            buffer |= (@as(u16, try self.peek8(bits - 8))) << 8;
-
-            self.bits_consumed = prev;
-
-            return buffer;
-        }
 
     fn toss(self: *BitStream, bits: usize) void{
         self.bits_consumed += bits;
@@ -135,8 +115,11 @@ const readInt = mem.readInt;
 const end_of_block: u15 = 256;
 const is_little_endian = builtin.cpu.arch.endian() == .little;
 
+var _io: std.Io = undefined; // for debugging
+
 /// path -> relative
 pub fn load(path: []const u8, gpa: Allocator, io: Io) !MooImage{
+    _io = io;
 
     var buff: [4096]u8 = undefined;
     var f = try Io.Dir.cwd().openFile(io, path, .{});
@@ -166,7 +149,15 @@ pub fn load(path: []const u8, gpa: Allocator, io: Io) !MooImage{
     const compressed_data: []u8 = try readCompressedData(r, gpa);
     defer gpa.free(compressed_data);
 
+    var t = Io.Clock.awake.now(io);
+
     try readZlib(compressed_data, filtered_image);
+
+    const time = t.untilNow(io, .awake).toNanoseconds();
+
+    std.debug.print("readZlib {} ms\n", 
+            .{@as(f64, @floatFromInt(@as(i64, @truncate(time)))) / 1000000});
+
     try unfilter(filtered_image, image, width * 3, height);
 
     return .{
@@ -232,8 +223,14 @@ fn readZlib(data: []u8, buffer: []u8) !void{
     _ = flg;
     var stream = BitStream{.buffer = data[2..data.len-@sizeOf(u32)]};
     
+    var t = Io.Clock.awake.now(_io); 
+
     try decodeDeflate(&stream, buffer);
 
+    const time = t.untilNow(_io, .awake).toNanoseconds();
+
+    std.debug.print("deflate {} ms\n", 
+            .{@as(f64, @floatFromInt(@as(i64, @truncate(time)))) / 1000000});
 }
 
 // bloque 2
@@ -262,9 +259,8 @@ fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
             huffman_codes = try readCustomHuffmanPrefixCodes(stream);   
         }
         
-        var stop = false;
-
-        while(!stop){
+ 
+        while(true){
             const symbol = 
                 try decode(
                     &huffman_codes.ll_symbols, 
@@ -274,13 +270,11 @@ fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
         
             if(symbol < end_of_block){
                 //print("byte(curr byte => {}) {}\n", .{curr_byte, symbol});
+                @branchHint(.likely);
  
                 buffer[curr_byte] = @intCast(symbol);
                 curr_byte += 1;
 
-            }else if(symbol == end_of_block){
-                stop = true;
-                //print("EOB\n", .{});
             }else if(symbol > end_of_block){
 
                 const length = 
@@ -298,20 +292,34 @@ fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
 
                 //print("pair length({}) {}, distance({}) {}\n", .{symbol, length, d_symbol, distance});
 
+
                 const start = curr_byte - distance;
 
-                const end = start + length;
-          
-                const slice = buffer[start..end];
+                if(length > distance){
 
-                for(0..length) |i| buffer[curr_byte + i] = slice[i];
+                    const slice = buffer[start..curr_byte];
+                    @memcpy(buffer[curr_byte..(curr_byte + distance)], slice);
+
+                    const start_overlap = (curr_byte + distance);
+                    const new_len = length - distance;
+                    for(0..new_len) |i| buffer[start_overlap + i] = buffer[curr_byte + i];
+                }else{
+
+                    const end = start + length;
+
+                    const slice = buffer[start..end];
+                    @memcpy(buffer[curr_byte..curr_byte+length], slice);
+                }
 
                 curr_byte += length;
+            }else{
+                @branchHint(.unlikely);
+                break;
             }
+            
         }
     }
 }
-
 
 
 fn readCustomHuffmanPrefixCodes(stream: *BitStream) !HuffmanPrefixCodes{
@@ -347,13 +355,8 @@ fn readCustomHuffmanPrefixCodes(stream: *BitStream) !HuffmanPrefixCodes{
         }}.f
     );
 
-    const biggest_cl_lenght = bk: {
-        var val: u16 = 0;
-        for(0..hclen) |i| {
-            if(cl_symbols[i].len > val) val = cl_symbols[i].len;
-        }
-        break :bk val;
-    };
+    const biggest_cl_lenght = cl_symbols[hclen - 1].len; 
+
 
     //for(0..hclen) |i| print("name -> {}, code -> {b}, len -> {}\n", .{
     //    cl_symbols[i].name,
@@ -497,17 +500,28 @@ fn decode(symbols: []Symbol, n: u16, biggest: u16, stream: *BitStream) !u15{
 
     const max_code =  try stream.peek(biggest);
 
+    const mask_table = comptime bk: {
+        var masks: [16]u16 = undefined;
+
+        for (0..16) |i| {
+            masks[i] = ~(-%(@as(u16, 1) << @intCast(i)));
+        }
+
+        break :bk masks;
+    };
+
     for(0..n)|i|{
         const len = symbols[i].len;
 
         if(len != 0 and 
-            (reverse(len, (max_code & ((~(-%(@as(u16, 1) << @intCast(len)))))))) == symbols[i].code){
+            (reverse(len, (max_code & mask_table[len]))) == symbols[i].code){
 
             stream.toss(len);
             
             return symbols[i].name;
         }
     }
+    
     return error.SymbolNotFound;
 }
 
@@ -539,11 +553,9 @@ fn sort(symbols: []Symbol, new_len: *u16) void{
 }
 
 inline fn reverse(len: usize, bits: u16) u16{
-
     const extra = 16 - len;
 
     return @bitReverse(bits) >> @intCast(extra);
-    
 }
 
 inline fn genHuffmanCodes(symbols: []Symbol, n: usize) void{

@@ -24,35 +24,8 @@ const Flg = packed struct {
 };
 
 const HuffmanPrefixCodes = struct{
-    biggest_ll_length: u16 = 0,
-    biggest_d_length: u16 = 0,
-
-    d_count: u16 = 0,
-    ll_count: u16 = 0,
-
-    ll_symbols: [285]Symbol = bk: {
-        var s: [285]Symbol = undefined;
-
-        for(0..s.len) |i|{
-            s[i].name = i;
-            s[i].len = 0;
-            s[i].code = 0;
-        }
-
-        break :bk s;
-    }, 
-
-    d_symbols: [32]Symbol = bk: {
-        var s: [32]Symbol = undefined;
-
-        for(0..s.len) |i|{
-            s[i].name = i;
-            s[i].len = 0;
-            s[i].code = 0;
-        }
-
-        break :bk s;
-    }
+    ll_symbols: LlSymbols = .{}, 
+    d_symbols: DSymbols = .{},
 };
 
 const BitStream = struct {
@@ -104,19 +77,151 @@ const DeflateHeaderBlock = packed struct {
     btype: u2 = 0, // 0 -> uncompressed, 1 -> fixed huffman codes, 2 -> custom huffman codes
 };
 
-const Symbol = struct{
-    name: u15 = 0,
-    code: u15 = 0,
-    len: u4 = 0,
-};
+fn Symbols(size: comptime_int) type{
+    return struct {
+
+        const Self = @This();
+
+        sortByName: bool = true,
+
+        biggest_len: u4 = 0,
+
+        count: u16 = 0,
+
+        name: [size]u15 = bk: {
+            var s: [size]u15 = undefined;
+
+            for(0..s.len) |i|{
+                s[i] = i;
+            }
+
+            break :bk s;
+        },
+        code: [size]u15 = @splat(0),
+        clen: [size]u4 = @splat(0),
+        table: [32768]u15 = @splat(0),
+
+        pub fn initWithCustomNames(names: *const [size]u15) Self{
+            comptime var self: Self = .{};
+            
+            inline for(0..size) |i|{
+                self.name[i] = names[i];
+            }
+
+            return self;
+        }
+        
+        pub fn swap(self: *Self, i: usize, j: usize) void{
+            if(i == j) return;
+            const len = self.clen[i];
+            const code = self.code[i];
+            const name = self.name[i];
+
+            self.clen[i] = self.clen[j]; 
+            self.code[i] = self.code[j];
+            self.name[i] = self.name[j];
+
+            self.clen[j] = len;
+            self.code[j] = code;
+            self.name[j] = name;
+        }
+
+        pub fn lessThan(self: *Self, i: usize, j: usize) bool{
+            if(i == j) return false;
+            
+            return if(self.clen[i] == self.clen[j]) 
+                return self.name[i] < self.name[j] else
+                return self.clen[i] < self.clen[j]; 
+        }
+
+        pub fn sort(self: *Self) void{
+            for(0..self.count) |i|{
+                const len = self.clen[i];
+
+                if(len == 0){
+                    var j: usize = self.count - 1;
+                    while(j > i and self.clen[j] == 0):(j -= 1){}
+                    if(i == j) {
+                        self.count = @intCast(j);
+                        break;
+                    }
+                    
+                    self.swap(i, j);
+                }
+            }
+
+
+            std.sort.heapContext(0, self.count, self); 
+            self.biggest_len = self.clen[self.count - 1];
+        }
+
+        pub fn decode(self: *Self, stream: *BitStream) !u15{
+
+            const max_code =  try stream.peek(self.biggest_len);
+
+            const mask_table = comptime bk: {
+                var masks: [16]u16 = undefined;
+
+                for (0..16) |i| {
+                    masks[i] = ~(-%(@as(u16, 1) << @intCast(i)));
+                }
+
+                break :bk masks;
+            };
+
+            for(0..self.count)|i|{
+                const len = self.clen[i];
+
+                if(len != 0 and 
+                    (reverse(len, (max_code & mask_table[len]))) == self.code[i]){
+
+                    stream.toss(len);
+                    
+                    return self.name[i];
+                }
+            }
+
+            return error.SymbolNotFound;
+        }
+
+        pub fn genHuffmanCodes(self: *Self) void{
+            var bl_count: [19]usize = @splat(0);
+            var max_bits: usize = 0; 
+            var next_code: [19]u15 = @splat(0);
+
+            for(0..self.count) |i|{
+                const len = self.clen[i];
+                bl_count[len] += 1;
+                if(len > max_bits) max_bits = len;
+            }
+            
+            var code: u15 = 0;
+            bl_count[0] = 0;
+            for(1..max_bits+1) |bits|{
+                code = (code + @as(u15, @intCast(bl_count[bits - 1]))) << 1;
+                next_code[bits] = code;
+            }
+            
+            for(0..self.count) |i|{
+                const len = self.clen[i];
+                self.code[i] = next_code[len];
+                next_code[len] += 1;
+            }
+        }
+    };
+}
+
+const LlSymbols = Symbols(285);
+const DSymbols = Symbols(32);
+const CLSymbols = Symbols(19);
 
 const readInt = mem.readInt;
+const print = std.debug.print;
 
 const end_of_block: u15 = 256;
 const is_little_endian = builtin.cpu.arch.endian() == .little;
 
 var _io: std.Io = undefined; // for debugging
-
 /// path -> relative
 pub fn load(path: []const u8, gpa: Allocator, io: Io) !MooImage{
     _io = io;
@@ -149,14 +254,9 @@ pub fn load(path: []const u8, gpa: Allocator, io: Io) !MooImage{
     const compressed_data: []u8 = try readCompressedData(r, gpa);
     defer gpa.free(compressed_data);
 
-    var t = Io.Clock.awake.now(io);
 
     try readZlib(compressed_data, filtered_image);
 
-    const time = t.untilNow(io, .awake).toNanoseconds();
-
-    std.debug.print("readZlib {} ms\n", 
-            .{@as(f64, @floatFromInt(@as(i64, @truncate(time)))) / 1000000});
 
     try unfilter(filtered_image, image, width * 3, height);
 
@@ -222,15 +322,9 @@ fn readZlib(data: []u8, buffer: []u8) !void{
     _ = cmf;
     _ = flg;
     var stream = BitStream{.buffer = data[2..data.len-@sizeOf(u32)]};
-    
-    var t = Io.Clock.awake.now(_io); 
 
     try decodeDeflate(&stream, buffer);
 
-    const time = t.untilNow(_io, .awake).toNanoseconds();
-
-    std.debug.print("deflate {} ms\n", 
-            .{@as(f64, @floatFromInt(@as(i64, @truncate(time)))) / 1000000});
 }
 
 // bloque 2
@@ -262,11 +356,7 @@ fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
  
         while(true){
             const symbol = 
-                try decode(
-                    &huffman_codes.ll_symbols, 
-                    huffman_codes.ll_count, 
-                    huffman_codes.biggest_ll_length, 
-                    stream);
+                try huffman_codes.ll_symbols.decode(stream);
         
             if(symbol < end_of_block){
                 //print("byte(curr byte => {}) {}\n", .{curr_byte, symbol});
@@ -281,11 +371,7 @@ fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
                     try decodeLength(symbol, stream);
 
                 const d_symbol = 
-                    try decode(
-                        &huffman_codes.d_symbols, 
-                        huffman_codes.d_count,
-                        huffman_codes.biggest_d_length, 
-                        stream);
+                    try huffman_codes.d_symbols.decode(stream);
 
                 const distance = 
                     try decodeDistance(d_symbol, stream);
@@ -325,48 +411,31 @@ fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
 fn readCustomHuffmanPrefixCodes(stream: *BitStream) !HuffmanPrefixCodes{
     const hlit: u16 = @intCast(try stream.read(5));
     const hdist: u16 = @intCast(try stream.read(5));
-    var hclen: u16 = @as(u16, @intCast(try stream.read(4))) + 4;
+    const hclen: u16 = @as(u16, @intCast(try stream.read(4))) + 4;
 
-    var cl_symbols = comptime bk: {
-        var symbols: [19]Symbol = undefined;
-        const cl_names = [_]u15{16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
-        
-        for(0..19) |i|{
-            symbols[i].name = cl_names[i];
-            symbols[i].code = 0;
-            symbols[i].len = 0;
-        }
+    const cl_names = [_]u15{16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
 
-        break :bk symbols;
-    };
+    var cl_symbols: CLSymbols = comptime .initWithCustomNames(&cl_names);
+    cl_symbols.count = hclen;
 
-    for(0..hclen)|i|{
-        cl_symbols[i].len = @intCast(try stream.read(3));
+    for(0..cl_symbols.count)|i|{
+        cl_symbols.clen[i] = @intCast(try stream.read(3));
     }
-
-    sort(&cl_symbols, &hclen); // sort by name
     
-    genHuffmanCodes(&cl_symbols, hclen);
-
-    std.sort.block(Symbol, cl_symbols[0..hclen], cl_symbols, struct{
-        fn f(ctx: @TypeOf(cl_symbols), lhs: Symbol, rhs: Symbol) bool{
-            _ = ctx;
-            return lhs.code < rhs.code;
-        }}.f
-    );
-
-    const biggest_cl_lenght = cl_symbols[hclen - 1].len; 
+    cl_symbols.sort();
+    
+    cl_symbols.genHuffmanCodes();
 
 
     //for(0..hclen) |i| print("name -> {}, code -> {b}, len -> {}\n", .{
-    //    cl_symbols[i].name,
-    //    cl_symbols[i].code,
-    //    cl_symbols[i].len,
+    //    cl_symbols.name[i],
+    //    cl_symbols.code[i],
+    //    cl_symbols.clen[i],
     //});
 
     var h_codes = HuffmanPrefixCodes{
-        .d_count = hdist + 1,
-        .ll_count = hlit + 257,
+        .d_symbols = .{ .count = hdist + 1 },
+        .ll_symbols = .{ .count = hlit + 257 },
     };
 
     var code_lengths: [317]u4 = @splat(0);
@@ -374,7 +443,9 @@ fn readCustomHuffmanPrefixCodes(stream: *BitStream) !HuffmanPrefixCodes{
 
     while(code_len < hlit+hdist+258){
 
-        const code_symbol = try decode(&cl_symbols, hclen, biggest_cl_lenght, stream);
+        const code_symbol = 
+            try cl_symbols.decode(stream);
+
         if(code_symbol <= 15){
 
             code_lengths[code_len] = @intCast(code_symbol);
@@ -403,34 +474,18 @@ fn readCustomHuffmanPrefixCodes(stream: *BitStream) !HuffmanPrefixCodes{
         
     }
 
-    for(0..h_codes.ll_count) |i| h_codes.ll_symbols[i].len = code_lengths[i];
-    for(0..h_codes.d_count) |i| h_codes.d_symbols[i].len = code_lengths[h_codes.ll_count + i];
+    const lenl = h_codes.ll_symbols.count;
+    const lend = h_codes.d_symbols.count;
 
-    sort(&h_codes.ll_symbols, &h_codes.ll_count); 
-    sort(&h_codes.d_symbols, &h_codes.d_count); 
+    @memcpy(h_codes.ll_symbols.clen[0..lenl], code_lengths[0..lenl]);
+    @memcpy(h_codes.d_symbols.clen[0..lend], code_lengths[lenl..lenl + lend]);
+    
+    h_codes.ll_symbols.sort();
+    h_codes.d_symbols.sort();
 
-    genHuffmanCodes(&h_codes.ll_symbols, h_codes.ll_count);
-    genHuffmanCodes(&h_codes.d_symbols, h_codes.d_count);
+    h_codes.ll_symbols.genHuffmanCodes();
+    h_codes.d_symbols.genHuffmanCodes();
 
-    std.sort.block(Symbol, h_codes.ll_symbols[0..h_codes.ll_count],
-    {}, 
-    struct{
-        fn f(_: void, lhs: Symbol, rhs: Symbol) bool{
-
-            return lhs.code < rhs.code;
-        }}.f
-    );
-
-    std.sort.block(Symbol, h_codes.d_symbols[0..h_codes.d_count],
-    {}, 
-    struct{
-        fn f(_: void, lhs: Symbol, rhs: Symbol) bool{
-            return lhs.code < rhs.code;
-        }}.f
-    );
-
-    h_codes.biggest_ll_length = h_codes.ll_symbols[h_codes.ll_count - 1].len;
-    h_codes.biggest_d_length = h_codes.d_symbols[h_codes.d_count - 1].len;
 
     //for(0..h_codes.ll_count) |i| print("name -> {}, code -> {b}, len -> {}\n", .{
     //    h_codes.ll_symbols[i].name,
@@ -496,61 +551,6 @@ fn decodeLength(symbol: u15, stream: *BitStream) !u16{
 }
 
 
-fn decode(symbols: []Symbol, n: u16, biggest: u16, stream: *BitStream) !u15{
-
-    const max_code =  try stream.peek(biggest);
-
-    const mask_table = comptime bk: {
-        var masks: [16]u16 = undefined;
-
-        for (0..16) |i| {
-            masks[i] = ~(-%(@as(u16, 1) << @intCast(i)));
-        }
-
-        break :bk masks;
-    };
-
-    for(0..n)|i|{
-        const len = symbols[i].len;
-
-        if(len != 0 and 
-            (reverse(len, (max_code & mask_table[len]))) == symbols[i].code){
-
-            stream.toss(len);
-            
-            return symbols[i].name;
-        }
-    }
-    
-    return error.SymbolNotFound;
-}
-
-fn sort(symbols: []Symbol, new_len: *u16) void{
-    for(0..symbols.len) |i|{
-        const s = symbols[i];
-
-        if(s.len == 0){
-            var j: usize = symbols.len - 1;
-            while(j > i and symbols[j].len == 0):(j -= 1){}
-            if(i == j) {
-                new_len.* = @intCast(j);
-                break;
-            }
-
-            symbols[i] = symbols[j];
-            symbols[j] = s;
-        }
-    }
-
-
-    std.sort.block(Symbol, symbols[0..new_len.*], symbols, struct{
-        fn f(ctx: []Symbol, lhs: Symbol, rhs: Symbol) bool{
-            _ = ctx;
-            return lhs.name < rhs.name;
-        }}.f
-    );
-    
-}
 
 inline fn reverse(len: usize, bits: u16) u16{
     const extra = 16 - len;
@@ -558,28 +558,7 @@ inline fn reverse(len: usize, bits: u16) u16{
     return @bitReverse(bits) >> @intCast(extra);
 }
 
-inline fn genHuffmanCodes(symbols: []Symbol, n: usize) void{
-    var bl_count: [19]usize = @splat(0);
-    var max_bits: usize = 0; 
-    var next_code: [19]u15 = @splat(0);
 
-    for(0..n) |i|{
-        bl_count[symbols[i].len] += 1;
-        if(symbols[i].len > max_bits) max_bits = symbols[i].len;
-    }
-    
-    var code: u15 = 0;
-    bl_count[0] = 0;
-    for(1..max_bits+1) |bits|{
-        code = (code + @as(u15, @intCast(bl_count[bits - 1]))) << 1;
-        next_code[bits] = code;
-    }
-    
-    for(0..n) |i|{
-        symbols[i].code = next_code[symbols[i].len];
-        next_code[symbols[i].len] += 1;
-    }
-}
 
 /// Leer chunks criticos
 /// IDAT 

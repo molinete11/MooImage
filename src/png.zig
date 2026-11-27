@@ -169,16 +169,32 @@ fn Symbols(size: comptime_int) type{
                 break :bk masks;
             };
 
+            var len_entries: [16]?u15 = @splat(null);
+
             for(0..self.count)|i|{
                 const len = self.clen[i];
 
-                if( 
-                    (reverse(len, (max_code & mask_table[len]))) == self.code[i]){
+                if(len_entries[len] == null){
+                    const gen_code = reverse(len, (max_code & mask_table[len]));
 
-                    stream.toss(len);
-                    
-                    return self.name[i];
+                    if( gen_code == self.code[i]){
+
+                        stream.toss(len);
+                        
+                        return self.name[i];
+                    }
+
+                    len_entries[len] = @intCast(gen_code);
+                }else{
+                    if(len_entries[len] == self.code[i]){
+
+                        stream.toss(len);
+                        
+                        return self.name[i];
+                    }
                 }
+
+               
             }
 
             return error.SymbolNotFound;

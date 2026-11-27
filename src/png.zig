@@ -99,7 +99,7 @@ fn Symbols(size: comptime_int) type{
         },
         code: [size]u15 = @splat(0),
         clen: [size]u4 = @splat(0),
-        table: [32768]u15 = @splat(0),
+
 
         pub fn initWithCustomNames(names: *const [size]u15) Self{
             comptime var self: Self = .{};
@@ -172,7 +172,7 @@ fn Symbols(size: comptime_int) type{
             for(0..self.count)|i|{
                 const len = self.clen[i];
 
-                if(len != 0 and 
+                if( 
                     (reverse(len, (max_code & mask_table[len]))) == self.code[i]){
 
                     stream.toss(len);

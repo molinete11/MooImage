@@ -82,8 +82,6 @@ fn Symbols(size: comptime_int) type{
 
         const Self = @This();
 
-        sortByName: bool = true,
-
         biggest_len: u4 = 0,
 
         count: u16 = 0,
@@ -319,7 +317,7 @@ fn unfilter(data: []u8, out: []u8, stride: usize, n_scanlines: usize) !void{
     }
 }
 
-fn paeth(a: u8, b: u8, c: u8) u8{
+inline fn paeth(a: u8, b: u8, c: u8) u8{
     const p = @as(i32, a) + b - c;
     const pa = @abs(p - a);
     const pb = @abs(p - b);
@@ -353,7 +351,7 @@ fn readZlib(data: []u8, buffer: []u8) !void{
 // cosas a tener en cuenta
 //
 
-fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
+inline fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
 
     var last: bool = false;
     var curr_byte: usize = 0;
@@ -368,7 +366,6 @@ fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
         else if(h.btype == 2){
             huffman_codes = try readCustomHuffmanPrefixCodes(stream);   
         }
-        
  
         while(true){
             const symbol = 
@@ -518,7 +515,7 @@ fn readCustomHuffmanPrefixCodes(stream: *BitStream) !HuffmanPrefixCodes{
     return h_codes;
 }
 
-fn decodeDistance(symbol: u15, stream: *BitStream) !u16{
+inline fn decodeDistance(symbol: u15, stream: *BitStream) !u16{
     const distance_table = [_]u16{
         1, 2, 3, 4, 5, 7, 9, 13,
         17, 25, 33, 49, 65, 97, 129, 193,
@@ -541,7 +538,7 @@ fn decodeDistance(symbol: u15, stream: *BitStream) !u16{
     return start_distance + offset;
 }
 
-fn decodeLength(symbol: u15, stream: *BitStream) !u16{
+inline fn decodeLength(symbol: u15, stream: *BitStream) !u16{
 
     const length_table = [_]u16{
         3, 4, 5, 6, 7, 8, 9, 10,

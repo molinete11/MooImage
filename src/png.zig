@@ -42,7 +42,6 @@ const BitStream = struct {
         return ret;
     }
 
-
     fn peek(self: *BitStream, bits: usize) !u16{
         @setRuntimeSafety(false);
         if(bits == 0) return 0;
@@ -63,9 +62,7 @@ const BitStream = struct {
 
         const mask: u16 = ~(-%(@as(u16, 1) << @intCast(bits)));
         return @as(u16, @truncate((buffer >> @intCast(bit_idx)))) & mask;
-
     }
-
 
     fn toss(self: *BitStream, bits: usize) void{
         self.bits_consumed += bits;
@@ -169,6 +166,8 @@ fn Symbols(size: comptime_int) type{
 
             var len_entries: [16]?u15 = @splat(null);
 
+            
+
             for(0..self.count)|i|{
                 const len = self.clen[i];
 
@@ -191,8 +190,6 @@ fn Symbols(size: comptime_int) type{
                         return self.name[i];
                     }
                 }
-
-               
             }
 
             return error.SymbolNotFound;
@@ -420,7 +417,6 @@ inline fn decodeDeflate(stream: *BitStream, buffer: []u8) !void{
     }
 }
 
-
 fn readCustomHuffmanPrefixCodes(stream: *BitStream) !HuffmanPrefixCodes{
     const hlit: u16 = @intCast(try stream.read(5));
     const hdist: u16 = @intCast(try stream.read(5));
@@ -431,7 +427,18 @@ fn readCustomHuffmanPrefixCodes(stream: *BitStream) !HuffmanPrefixCodes{
     var cl_symbols: CLSymbols = comptime .initWithCustomNames(&cl_names);
     cl_symbols.count = hclen;
 
-    for(0..cl_symbols.count)|i|{
+    var i: usize = 0;
+    const ahead = 4;
+
+    while(i + ahead < cl_symbols.count):(i += ahead) {
+        const packed_codes = try stream.read(ahead * 3);
+
+        inline for(0..ahead) |j|{
+            cl_symbols.clen[i + j] = @intCast((packed_codes >> (3 * j)) & 7);
+        }
+    }
+
+    while(i < cl_symbols.count): (i += 1){
         cl_symbols.clen[i] = @intCast(try stream.read(3));
     }
     
